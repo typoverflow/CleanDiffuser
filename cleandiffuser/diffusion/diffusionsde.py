@@ -732,6 +732,85 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
         return xt, t, eps
 
     # ==================== Sampling: Solving SDE/ODE ======================
+    # added by gcx
+    def make_onestep_sample_fn(
+            self,
+            solver: str = "ddpm",
+            sample_steps: int = 5,
+            sample_step_schedule: Union[str, Callable] = "uniform_continuous",
+            use_ema: bool = True,
+            guided: bool = False,
+            # ----------- Warm-Starting -----------
+            warm_start_reference: Optional[torch.Tensor] = None,
+            warm_start_forward_level: float = 0.3,
+    ):
+        model = self.model if not use_ema else self.model_ema
+        
+        if isinstance(warm_start_reference, torch.Tensor) and warm_start_forward_level > 0.:
+            t_diffusion = [self.t_diffusion[0], warm_start_forward_level]
+        else:
+            t_diffusion = self.t_diffusion
+        if isinstance(sample_step_schedule, str):
+            if sample_step_schedule in SUPPORTED_SAMPLING_STEP_SCHEDULE.keys():
+                sample_step_schedule = SUPPORTED_SAMPLING_STEP_SCHEDULE[sample_step_schedule](
+                    t_diffusion, sample_steps)
+            else:
+                raise ValueError(f"Sampling step schedule {sample_step_schedule} is not supported.")
+        elif callable(sample_step_schedule):
+            sample_step_schedule = sample_step_schedule(t_diffusion, sample_steps)
+        else:
+            raise ValueError("sample_step_schedule must be a callable or a string")
+
+        sample_step_schedule = sample_step_schedule.to(self.device)
+        alphas, sigmas = self.noise_schedule_funcs["forward"](
+            sample_step_schedule, **(self.noise_schedule_params or {}))
+        alphas = alphas.unsqueeze(-1)
+        sigmas = sigmas.unsqueeze(-1)
+        logSNRs = torch.log(alphas / sigmas)
+        hs = torch.zeros_like(logSNRs)
+        hs[1:] = logSNRs[:-1] - logSNRs[1:]  # hs[0] is not correctly calculated, but it will not be used.
+        stds = torch.zeros((sample_steps + 1, 1), device=self.device)
+        stds[1:] = sigmas[:-1] / sigmas[1:] * (1 - (alphas[1:] / alphas[:-1]) ** 2).sqrt()
+        # stds[0] = 0.
+
+        def onestep_sample_fn(x0_or_xt, i, N, sample_xt=False, w: float = 1.0):
+            t = sample_step_schedule[i]
+            t_1 = sample_step_schedule[i - 1]
+            if sample_xt:
+                xt = self.add_noise(x0_or_xt, t)[0]
+            else:
+                xt = xt
+
+            alpha = alphas[i]
+            sigma = sigmas[i]
+            std = stds[i]
+            if guided:
+                log_p, pred = self.classifier_guidance(
+                    xt.clone().detach(),
+                    t, alpha, sigma, model
+                )
+            else:
+                pred = model["diffusion"](xt, t, None)
+            pred = self.clip_prediction(pred, xt, alpha, sigma)
+            
+            eps_theta = pred if self.predict_noise else xtheta_to_epstheta(xt, alpha, sigma, pred)
+            # x_theta = pred if not self.predict_noise else epstheta_to_xtheta(xt, alpha, sigma, pred)
+
+            if solver == "ddpm":
+                xt_1 = (
+                        (alphas[i - 1] / alphas[i]) * (xt - sigmas[i] * eps_theta) +
+                        (sigmas[i - 1] ** 2 - stds[i] ** 2 + 1e-8).sqrt() * eps_theta)
+                repeated_xt_1 = xt_1.repeat(N, *[1]*len(xt_1.shape))
+                noise = torch.randn_like(repeated_xt_1)
+                repeated_xt_1 += std * noise
+            else:
+                raise NotImplementedError
+            
+            if self.clip_pred:
+                repeated_xt_1 = repeated_xt_1.clip(self.x_min, self.x_max)
+            
+            return repeated_xt_1, xt, t_1, t
+        return onestep_sample_fn
 
     def sample(
             self,
