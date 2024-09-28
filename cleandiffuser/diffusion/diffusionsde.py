@@ -733,16 +733,33 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
 
     # ==================== Sampling: Solving SDE/ODE ======================
     # added by gcx
+    # def make_continuous_onestep_sample_fn(
+    #     self, 
+    #     solver: str = "ddpm", 
+    #     sample_interval: float = 0.1, 
+    #     use_ema: bool = True, 
+    #     # ----------- Warm-Starting -----------
+    #     warm_start_reference: Optional[torch.Tensor] = None,
+    #     warm_start_forward_level: float = 0.3,
+    # ):
+    #     model = self.model if not use_ema else self.model_ema
+
+    #     if isinstance(warm_start_reference, torch.Tensor) and warm_start_forward_level > 0.:
+    #         t_diffusion = [self.t_diffusion[0], warm_start_forward_level]
+    #     else:
+    #         t_diffusion = self.t_diffusion
+    #     if isinstance():
+    #         pass
+        
     def make_onestep_sample_fn(
-            self,
-            solver: str = "ddpm",
-            sample_steps: int = 5,
-            sample_step_schedule: Union[str, Callable] = "uniform_continuous",
-            use_ema: bool = True,
-            guided: bool = False,
-            # ----------- Warm-Starting -----------
-            warm_start_reference: Optional[torch.Tensor] = None,
-            warm_start_forward_level: float = 0.3,
+        self,
+        solver: str = "ddpm",
+        sample_steps: int = 5,
+        sample_step_schedule: Union[str, Callable] = "uniform_continuous",
+        use_ema: bool = True,
+        # ----------- Warm-Starting -----------
+        warm_start_reference: Optional[torch.Tensor] = None,
+        warm_start_forward_level: float = 0.3,
     ):
         model = self.model if not use_ema else self.model_ema
         
@@ -773,24 +790,18 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
         stds[1:] = sigmas[:-1] / sigmas[1:] * (1 - (alphas[1:] / alphas[:-1]) ** 2).sqrt()
         # stds[0] = 0.
 
-        def onestep_sample_fn(x0_or_xt, i, N, sample_xt=False, w: float = 1.0):
+        def onestep_sample_fn(x0_or_xt, i, N, cond=None, sample_xt=False, w: float = 1.0):
             t = sample_step_schedule[i]
             t_1 = sample_step_schedule[i - 1]
             if sample_xt:
                 xt = self.add_noise(x0_or_xt, t)[0]
             else:
-                xt = xt
+                xt = x0_or_xt
 
             alpha = alphas[i]
             sigma = sigmas[i]
             std = stds[i]
-            if guided:
-                log_p, pred = self.classifier_guidance(
-                    xt.clone().detach(),
-                    t, alpha, sigma, model
-                )
-            else:
-                pred = model["diffusion"](xt, t, None)
+            pred = model["diffusion"](xt, t, cond)
             pred = self.clip_prediction(pred, xt, alpha, sigma)
             
             eps_theta = pred if self.predict_noise else xtheta_to_epstheta(xt, alpha, sigma, pred)
@@ -802,7 +813,7 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
                         (sigmas[i - 1] ** 2 - stds[i] ** 2 + 1e-8).sqrt() * eps_theta)
                 repeated_xt_1 = xt_1.repeat(N, *[1]*len(xt_1.shape))
                 noise = torch.randn_like(repeated_xt_1)
-                repeated_xt_1 += std * noise
+                repeated_xt_1 += std * noise  # should enforce zero stochasticity when i == 1
             else:
                 raise NotImplementedError
             
@@ -810,7 +821,7 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
                 repeated_xt_1 = repeated_xt_1.clip(self.x_min, self.x_max)
             
             return repeated_xt_1, xt, t_1, t
-        return onestep_sample_fn
+        return onestep_sample_fn, sample_step_schedule
 
     def sample(
             self,
