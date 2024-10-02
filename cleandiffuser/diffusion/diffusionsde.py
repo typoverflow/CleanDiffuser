@@ -733,23 +733,93 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
 
     # ==================== Sampling: Solving SDE/ODE ======================
     # added by gcx
-    # def make_continuous_onestep_sample_fn(
-    #     self, 
-    #     solver: str = "ddpm", 
-    #     sample_interval: float = 0.1, 
-    #     use_ema: bool = True, 
-    #     # ----------- Warm-Starting -----------
-    #     warm_start_reference: Optional[torch.Tensor] = None,
-    #     warm_start_forward_level: float = 0.3,
-    # ):
-    #     model = self.model if not use_ema else self.model_ema
+    def make_continuous_onestep_sample_fn(
+        self, 
+        solver: str = "ddpm", 
+        sample_steps: int = 10, 
+        use_ema: bool = True, 
+    ):
+        model = self.model if not use_ema else self.model_ema
+        t_interval = (self.t_diffusion[1] - self.t_diffusion[0]) / sample_steps
+        def onestep_sample_fn(x0, N, cond=None):
+            t = torch.rand(size=(x0.shape[0])) * (self.t_diffusion[1] - self.t_diffusion[0])
+            t_1 = (t-t_interval).clip(min=0.0)
+            xt = self.add_noise(x0, t)[0]
+            alpha_t, sigma_t = self.noise_schedule_funcs["forward"](t, **(self.noise_schedule_params or {}))
+            alpha_t_1, sigma_t_1 = self.noise_schedule_funcs["forward"](t, **(self.noise_schedule_params or {}))
+            std = sigma_t / sigma_t_1 * (1 - (alpha_t / alpha_t_1) ** 2)
 
-    #     if isinstance(warm_start_reference, torch.Tensor) and warm_start_forward_level > 0.:
-    #         t_diffusion = [self.t_diffusion[0], warm_start_forward_level]
-    #     else:
-    #         t_diffusion = self.t_diffusion
-    #     if isinstance():
-    #         pass
+            pred = model["diffusion"](xt, t, cond)
+            pred = self.clip_prediction(pred, xt, alpha_t, sigma_t)
+            eps_theta = pred if self.predict_noise else xtheta_to_epstheta(xt, alpha_t, sigma_t, pred)
+
+            if solver == "ddpm":
+                xt_1 = (
+                    (alpha_t_1 / alpha_t) * (xt - sigma_t * eps_theta) + 
+                    (sigma_t_1 ** 2 - std ** 2 + 1e-8).sqrt() * eps_theta
+                )
+                repeated_xt_1 = xt_1.repeat(N, *[1]*len(xt_1.shape))
+                noise = torch.randn_like(repeated_xt_1)
+                repeated_xt_1 += std * noise  # CHECK: should remove this noise
+            else:
+                raise NotImplementedError
+            
+            if self.clip_pred:
+                repeated_xt_1 = repeated_xt_1.clip(self.x_min, self.x_max)
+            
+            return repeated_xt_1, xt, t_1, t
+        return onestep_sample_fn
+    
+    def make_discrete_onestep_sample_fn(
+        self, 
+        solver: str = "ddpm", 
+        sample_steps: int = 5, 
+        sample_step_schedule: Union[str, Callable] = "uniform_continuous", 
+        use_ema: bool = True
+    ):
+        model = self.model if not use_ema else self.model_ema
+        t_diffusion = self.t_diffusion
+        if isinstance(sample_step_schedule, str):
+            if sample_step_schedule in SUPPORTED_SAMPLING_STEP_SCHEDULE.keys():
+                sample_step_schedule = SUPPORTED_SAMPLING_STEP_SCHEDULE[sample_step_schedule](
+                    t_diffusion, sample_steps)
+            else:
+                raise ValueError(f"Sampling step schedule {sample_step_schedule} is not supported.")
+        elif callable(sample_step_schedule):
+            sample_step_schedule = sample_step_schedule(t_diffusion, sample_steps)
+        else:
+            raise ValueError("sample_step_schedule must be a callable or a string")
+        sample_step_schedule = sample_step_schedule.to(self.device)
+
+        def onestep_sample_fn(x0, N, cond=None):
+            i = torch.randint(1, sample_steps+1, size=x0.shape[0], device=self.device)
+            t = sample_step_schedule[i]
+            t_1 = sample_step_schedule[i-1]
+            xt = self.add_noise(x0, t)[0]
+            alpha_t, sigma_t = self.noise_schedule_funcs["forward"](t, **(self.noise_schedule_params or {}))
+            alpha_t_1, sigma_t_1 = self.noise_schedule_funcs["forward"](t, **(self.noise_schedule_params or {}))
+            std = sigma_t / sigma_t_1 * (1 - (alpha_t / alpha_t_1) ** 2)
+
+            pred = model["diffusion"](xt, t, cond)
+            pred = self.clip_prediction(pred, xt, alpha_t, sigma_t)
+            eps_theta = pred if self.predict_noise else xtheta_to_epstheta(xt, alpha_t, sigma_t, pred)
+
+            if solver == "ddpm":
+                xt_1 = (
+                    (alpha_t_1 / alpha_t) * (xt - sigma_t * eps_theta) + 
+                    (sigma_t_1 ** 2 - std ** 2 + 1e-8).sqrt() * eps_theta
+                )
+                repeated_xt_1 = xt_1.repeat(N, *[1]*len(xt_1.shape))
+                noise = torch.randn_like(repeated_xt_1)
+                repeated_xt_1 += std * noise  # CHECK: should remove this noise
+            else:
+                raise NotImplementedError
+            
+            if self.clip_pred:
+                repeated_xt_1 = repeated_xt_1.clip(self.x_min, self.x_max)
+            
+            return repeated_xt_1, xt, t_1, t
+        return onestep_sample_fn
         
     def make_onestep_sample_fn(
         self,
@@ -813,7 +883,7 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
                         (sigmas[i - 1] ** 2 - stds[i] ** 2 + 1e-8).sqrt() * eps_theta)
                 repeated_xt_1 = xt_1.repeat(N, *[1]*len(xt_1.shape))
                 noise = torch.randn_like(repeated_xt_1)
-                repeated_xt_1 += std * noise  # should enforce zero stochasticity when i == 1
+                repeated_xt_1 += std * noise  # CHECK: should enforce zero stochasticity when i == 1
             else:
                 raise NotImplementedError
             
