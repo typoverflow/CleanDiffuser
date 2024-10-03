@@ -737,17 +737,21 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
         self, 
         solver: str = "ddpm", 
         sample_steps: int = 10, 
+        sample_steps_n: float = 1.0, 
         use_ema: bool = True, 
     ):
         model = self.model if not use_ema else self.model_ema
-        t_interval = (self.t_diffusion[1] - self.t_diffusion[0]) / sample_steps
+        t_range = (self.t_diffusion[1] - self.t_diffusion[0])
         def onestep_sample_fn(x0, N, cond=None):
-            t = torch.rand(size=(x0.shape[0])) * (self.t_diffusion[1] - self.t_diffusion[0])
-            t_1 = (t-t_interval).clip(min=0.0)
+            # sample t and t_1
+            u = torch.rand(size=[x0.shape[0], ], device=self.device)
+            t = (u * t_range) ** sample_steps_n + self.t_diffusion[0]
+            t_1 = ((u - 1 / sample_steps).clip(min=0.0) * t_range) ** sample_steps_n + self.t_diffusion[0]
+            
             xt = self.add_noise(x0, t)[0]
-            alpha_t, sigma_t = self.noise_schedule_funcs["forward"](t, **(self.noise_schedule_params or {}))
-            alpha_t_1, sigma_t_1 = self.noise_schedule_funcs["forward"](t, **(self.noise_schedule_params or {}))
-            std = sigma_t / sigma_t_1 * (1 - (alpha_t / alpha_t_1) ** 2)
+            alpha_t, sigma_t = self.noise_schedule_funcs["forward"](t.unsqueeze(-1), **(self.noise_schedule_params or {}))
+            alpha_t_1, sigma_t_1 = self.noise_schedule_funcs["forward"](t_1.unsqueeze(-1), **(self.noise_schedule_params or {}))
+            std = sigma_t_1 / sigma_t * (1 - (alpha_t / alpha_t_1) ** 2).sqrt()
 
             pred = model["diffusion"](xt, t, cond)
             pred = self.clip_prediction(pred, xt, alpha_t, sigma_t)
@@ -774,31 +778,22 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
         self, 
         solver: str = "ddpm", 
         sample_steps: int = 5, 
-        sample_step_schedule: Union[str, Callable] = "uniform_continuous", 
+        sample_steps_n: float = 1.0, 
         use_ema: bool = True
     ):
         model = self.model if not use_ema else self.model_ema
-        t_diffusion = self.t_diffusion
-        if isinstance(sample_step_schedule, str):
-            if sample_step_schedule in SUPPORTED_SAMPLING_STEP_SCHEDULE.keys():
-                sample_step_schedule = SUPPORTED_SAMPLING_STEP_SCHEDULE[sample_step_schedule](
-                    t_diffusion, sample_steps)
-            else:
-                raise ValueError(f"Sampling step schedule {sample_step_schedule} is not supported.")
-        elif callable(sample_step_schedule):
-            sample_step_schedule = sample_step_schedule(t_diffusion, sample_steps)
-        else:
-            raise ValueError("sample_step_schedule must be a callable or a string")
+        sample_step_schedule = SUPPORTED_SAMPLING_STEP_SCHEDULE["quad_continuous"](self.t_diffusion, sample_steps, sample_steps_n)
         sample_step_schedule = sample_step_schedule.to(self.device)
 
         def onestep_sample_fn(x0, N, cond=None):
-            i = torch.randint(1, sample_steps+1, size=x0.shape[0], device=self.device)
+            i = torch.randint(1, sample_steps+1, size=[x0.shape[0], ], device=self.device)
             t = sample_step_schedule[i]
             t_1 = sample_step_schedule[i-1]
             xt = self.add_noise(x0, t)[0]
-            alpha_t, sigma_t = self.noise_schedule_funcs["forward"](t, **(self.noise_schedule_params or {}))
-            alpha_t_1, sigma_t_1 = self.noise_schedule_funcs["forward"](t, **(self.noise_schedule_params or {}))
-            std = sigma_t / sigma_t_1 * (1 - (alpha_t / alpha_t_1) ** 2)
+            alpha_t, sigma_t = self.noise_schedule_funcs["forward"](t.unsqueeze(-1), **(self.noise_schedule_params or {}))
+            alpha_t_1, sigma_t_1 = self.noise_schedule_funcs["forward"](t_1.unsqueeze(-1), **(self.noise_schedule_params or {}))
+            std_t = sigma_t_1 / sigma_t * (1 - (alpha_t / alpha_t_1) ** 2).sqrt()
+            h_t = torch.log(alpha_t_1 / sigma_t_1) - torch.log(alpha_t / sigma_t)
 
             pred = model["diffusion"](xt, t, cond)
             pred = self.clip_prediction(pred, xt, alpha_t, sigma_t)
@@ -807,11 +802,19 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
             if solver == "ddpm":
                 xt_1 = (
                     (alpha_t_1 / alpha_t) * (xt - sigma_t * eps_theta) + 
-                    (sigma_t_1 ** 2 - std ** 2 + 1e-8).sqrt() * eps_theta
+                    (sigma_t_1 ** 2 - std_t ** 2 + 1e-8).sqrt() * eps_theta
                 )
                 repeated_xt_1 = xt_1.repeat(N, *[1]*len(xt_1.shape))
                 noise = torch.randn_like(repeated_xt_1)
-                repeated_xt_1 += std * noise  # CHECK: should remove this noise
+                repeated_xt_1 += std_t * noise  # CHECK: should remove this noise
+            elif solver == "sde_dpmsolver_1":
+                xt_1 = (
+                    (alpha_t_1 / alpha_t) * xt - 
+                    2 * sigma_t_1 * torch.expm1(h_t) * eps_theta
+                )
+                repeated_xt_1 = xt_1.repeat(N, *[1]*len(xt_1.shape))
+                noise = torch.randn_like(repeated_xt_1)
+                repeated_xt_1 += sigma_t_1 * torch.expm1(2 * h_t).sqrt() * noise
             else:
                 raise NotImplementedError
             
@@ -879,11 +882,20 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
 
             if solver == "ddpm":
                 xt_1 = (
-                        (alphas[i - 1] / alphas[i]) * (xt - sigmas[i] * eps_theta) +
-                        (sigmas[i - 1] ** 2 - stds[i] ** 2 + 1e-8).sqrt() * eps_theta)
+                    (alphas[i - 1] / alphas[i]) * (xt - sigmas[i] * eps_theta) +
+                    (sigmas[i - 1] ** 2 - stds[i] ** 2 + 1e-8).sqrt() * eps_theta
+                )
                 repeated_xt_1 = xt_1.repeat(N, *[1]*len(xt_1.shape))
                 noise = torch.randn_like(repeated_xt_1)
                 repeated_xt_1 += std * noise  # CHECK: should enforce zero stochasticity when i == 1
+            elif solver == "sde_dpmsolver_1":
+                xt = (
+                    (alphas[i - 1] / alphas[i]) * xt -
+                    2 * sigmas[i - 1] * torch.expm1(hs[i]) * eps_theta
+                )
+                repeated_xt_1 = xt.repeat(N, *[1]*len(xt.shape))
+                noise = torch.randn_like(repeated_xt_1)
+                repeated_xt_1 += sigmas[i - 1] * torch.expm1(2 * hs[i]).sqrt() * noise
             else:
                 raise NotImplementedError
             
