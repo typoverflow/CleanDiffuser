@@ -738,15 +738,17 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
         solver: str = "ddpm", 
         sample_steps: int = 10, 
         sample_steps_n: float = 1.0, 
+        epsilon: Optional[float] = None, 
         use_ema: bool = True, 
     ):
         model = self.model if not use_ema else self.model_ema
-        t_range = (self.t_diffusion[1] - self.t_diffusion[0])
+        t_diffusion = self.t_diffusion if epsilon is None else [epsilon, 1.0]
+        t_range = (t_diffusion[1] - t_diffusion[0])
         def onestep_sample_fn(x0, N, cond=None):
             # sample t and t_1
             u = torch.rand(size=[x0.shape[0], ], device=self.device)
-            t = (u * t_range) ** sample_steps_n + self.t_diffusion[0]
-            t_1 = ((u - 1 / sample_steps).clip(min=0.0) * t_range) ** sample_steps_n + self.t_diffusion[0]
+            t = (u * t_range) ** sample_steps_n + t_diffusion[0]
+            t_1 = ((u - 1 / sample_steps).clip(min=0.0) * t_range) ** sample_steps_n + t_diffusion[0]
             
             xt = self.add_noise(x0, t)[0]
             alpha_t, sigma_t = self.noise_schedule_funcs["forward"](t.unsqueeze(-1), **(self.noise_schedule_params or {}))
@@ -779,10 +781,12 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
         solver: str = "ddpm", 
         sample_steps: int = 5, 
         sample_steps_n: float = 1.0, 
+        epsilon: Optional[float] = None, 
         use_ema: bool = True
     ):
         model = self.model if not use_ema else self.model_ema
-        sample_step_schedule = SUPPORTED_SAMPLING_STEP_SCHEDULE["quad_continuous"](self.t_diffusion, sample_steps, sample_steps_n)
+        t_diffusion = self.t_diffusion if epsilon is None else [epsilon, 1.0]
+        sample_step_schedule = SUPPORTED_SAMPLING_STEP_SCHEDULE["quad_continuous"](t_diffusion, sample_steps, sample_steps_n)
         sample_step_schedule = sample_step_schedule.to(self.device)
 
         def onestep_sample_fn(x0, N, cond=None):
