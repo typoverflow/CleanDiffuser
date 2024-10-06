@@ -753,7 +753,8 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
             xt = self.add_noise(x0, t)[0]
             alpha_t, sigma_t = self.noise_schedule_funcs["forward"](t.unsqueeze(-1), **(self.noise_schedule_params or {}))
             alpha_t_1, sigma_t_1 = self.noise_schedule_funcs["forward"](t_1.unsqueeze(-1), **(self.noise_schedule_params or {}))
-            std = sigma_t_1 / sigma_t * (1 - (alpha_t / alpha_t_1) ** 2).sqrt()
+            std_t = sigma_t_1 / sigma_t * (1 - (alpha_t / alpha_t_1) ** 2).sqrt()
+            h_t = torch.log(alpha_t_1 / sigma_t_1) - torch.log(alpha_t / sigma_t)
 
             pred = model["diffusion"](xt, t, cond)
             pred = self.clip_prediction(pred, xt, alpha_t, sigma_t)
@@ -766,7 +767,15 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
                 )
                 repeated_xt_1 = xt_1.repeat(N, *[1]*len(xt_1.shape))
                 noise = torch.randn_like(repeated_xt_1)
-                repeated_xt_1 += std * noise  # CHECK: should remove this noise
+                repeated_xt_1 += std_t * noise
+            elif solver == "sde_dpmsolver_1":
+                xt_1 = (
+                    (alpha_t_1 / alpha_t) * xt - 
+                    2 * sigma_t_1 * torch.expm1(h_t) * eps_theta
+                )
+                repeated_xt_1 = xt_1.repeat(N, *[1]*len(xt_1.shape))
+                noise = torch.randn_like(repeated_xt_1)
+                repeated_xt_1 += sigma_t_1 * torch.expm1(2 * h_t).sqrt() * noise
             else:
                 raise NotImplementedError
             
@@ -810,7 +819,7 @@ class ContinuousDiffusionSDE(BaseDiffusionSDE):
                 )
                 repeated_xt_1 = xt_1.repeat(N, *[1]*len(xt_1.shape))
                 noise = torch.randn_like(repeated_xt_1)
-                repeated_xt_1 += std_t * noise  # CHECK: should remove this noise
+                repeated_xt_1 += std_t * noise
             elif solver == "sde_dpmsolver_1":
                 xt_1 = (
                     (alpha_t_1 / alpha_t) * xt - 
